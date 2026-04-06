@@ -86,6 +86,7 @@ func main() {
 	authHandler := handler.NewAuthHandler(authService, log)
 	chatHandler := handler.NewChatHandler(chatService, log)
 	streamHandler := handler.NewStreamHandler(streamService, cfg.OpenRouter.DefaultModel, log)
+	facadeHandler := handler.NewFacadeHandler(chatService, cfg.OpenRouter.DefaultModel, rateLimiter, log)
 
 	// ── Initialize Router ──────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -133,6 +134,12 @@ func main() {
 			r.Use(rateLimiter.Handler("stream"))
 			r.Use(middleware.StreamTimeout(cfg.Timeout.Stream))
 			streamHandler.RegisterRoutes(r)
+		})
+
+		// Façade routes (simplified client-facing endpoints)
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.Timeout(cfg.Timeout.Default))
+			facadeHandler.RegisterRoutes(r)
 		})
 	})
 
