@@ -393,7 +393,9 @@ func (s *ChatService) FacadeStream(ctx context.Context, userID uuid.UUID, input 
 							CreatedAt: time.Now(),
 						}
 						// Async context background so it saves even if original ctx canceled
-						_ = s.messageRepo.Create(context.Background(), assistantMsg)
+						if err := s.messageRepo.Create(context.Background(), assistantMsg); err != nil {
+							s.log.ErrorContext(context.Background(), "failed to persist assistant message", "chat_id", chatID, "message_id", assistantMsg.ID, "error", err)
+						}
 					}
 					return
 				}
@@ -424,7 +426,9 @@ func (s *ChatService) FacadeStream(ctx context.Context, userID uuid.UUID, input 
 						Model:     finalModel,
 						CreatedAt: time.Now(),
 					}
-					_ = s.messageRepo.Create(context.Background(), assistantMsg)
+					if err := s.messageRepo.Create(context.Background(), assistantMsg); err != nil {
+						s.log.ErrorContext(context.Background(), "failed to persist assistant message", "chat_id", chatID, "message_id", assistantMsg.ID, "error", err)
+					}
 				}
 				return
 				
@@ -439,7 +443,9 @@ func (s *ChatService) FacadeStream(ctx context.Context, userID uuid.UUID, input 
 						Model:     finalModel,
 						CreatedAt: time.Now(),
 					}
-					_ = s.messageRepo.Create(context.Background(), assistantMsg)
+					if err := s.messageRepo.Create(context.Background(), assistantMsg); err != nil {
+						s.log.ErrorContext(context.Background(), "failed to persist assistant message", "chat_id", chatID, "message_id", assistantMsg.ID, "error", err)
+					}
 				}
 				return
 			}

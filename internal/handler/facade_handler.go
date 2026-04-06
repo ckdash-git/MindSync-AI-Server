@@ -229,7 +229,7 @@ func (h *FacadeHandler) StreamChat(w http.ResponseWriter, r *http.Request) {
 		headerData, _ := json.Marshal(header)
 		fmt.Fprintf(w, "event: error\ndata: %s\n\n", headerData)
 		flusher.Flush()
-		h.handleError(w, r, err)
+		h.log.ErrorContext(r.Context(), "failed to start stream", "error", err)
 		return
 	}
 
@@ -335,18 +335,9 @@ func (h *FacadeHandler) AICouncil(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	models := req.Models
-	if len(models) == 0 {
-		models = []string{
-			"openai/gpt-4o",
-			"anthropic/claude-3.5-sonnet",
-			"google/gemini-pro",
-		}
-	}
-
 	result, err := h.chatService.AICouncil(r.Context(), claims.UserID, service.AICouncilInput{
 		Question: req.Question,
-		Models:   models,
+		Models:   req.Models,
 		APIKey:   apiKey,
 	})
 	if err != nil {

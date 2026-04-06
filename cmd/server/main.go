@@ -77,9 +77,10 @@ func main() {
 	middleware.SetAuthMiddleware(authMiddleware)
 
 	rateLimiter := middleware.NewRateLimiter(middleware.RateLimitConfig{
-		AuthRPM:   cfg.RateLimit.AuthRPM,
-		ChatRPM:   cfg.RateLimit.ChatRPM,
-		StreamRPM: cfg.RateLimit.StreamRPM,
+		AuthRPM:    cfg.RateLimit.AuthRPM,
+		ChatRPM:    cfg.RateLimit.ChatRPM,
+		StreamRPM:  cfg.RateLimit.StreamRPM,
+		CouncilRPM: cfg.RateLimit.CouncilRPM,
 	})
 
 	// ── Initialize Handlers ────────────────────────────────────────────
