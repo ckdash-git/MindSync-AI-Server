@@ -5,11 +5,10 @@ import (
 	"net/http"
 )
 
-// Response is the standard API response envelope.
 type Response struct {
 	Success bool        `json:"success"`
-	Data    interface{} `json:"data,omitempty"`
-	Error   *ErrorBody  `json:"error,omitempty"`
+	Data    interface{} `json:"data"`
+	Error   *ErrorBody  `json:"error"`
 	Meta    *Meta       `json:"meta,omitempty"`
 }
 
