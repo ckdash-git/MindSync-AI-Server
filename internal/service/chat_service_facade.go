@@ -207,15 +207,16 @@ func (s *ChatService) AICouncil(ctx context.Context, userID uuid.UUID, input AIC
 		return &AICouncilResult{Opinions: opinions, FinalAnswer: "All models failed to provide an answer."}, nil
 	}
 
-	// Request final answer using the first model from the configured models (or default to the first valid one)
-	synthesisModel := input.Models[0]
+	// Request final answer using the first model that succeeded in council fan-out
+	synthesisModel := validOpinions[0].Model
 
 	synthChat, err := s.CreateChat(ctx, userID, CreateChatInput{
 		Title: fmt.Sprintf("Final: %s", title),
 		Model: synthesisModel,
 	})
 	if err != nil {
-		return &AICouncilResult{Opinions: opinions, FinalAnswer: "Failed to synthesize final answer: " + err.Error()}, nil
+		s.log.ErrorContext(ctx, "failed to create synthesis chat", "error", err)
+		return &AICouncilResult{Opinions: opinions, FinalAnswer: "Failed to synthesize final answer."}, nil
 	}
 
 	var sb strings.Builder
@@ -301,6 +302,10 @@ type FacadeStreamInput struct {
 // FacadeStream handles the streaming lifecycle: DB creation, intercepting stream chunks, 
 // immediately passing them to the client, forming the final message, and saving it to the DB asynchronously.
 func (s *ChatService) FacadeStream(ctx context.Context, userID uuid.UUID, input FacadeStreamInput, streamSvc *StreamService) (<-chan StreamChunk, <-chan error, string, error) {
+	if streamSvc == nil {
+		return nil, nil, "", fmt.Errorf("stream service is required")
+	}
+
 	var chatID uuid.UUID
 	var chat *domain.Chat
 
@@ -378,26 +383,12 @@ func (s *ChatService) FacadeStream(ctx context.Context, userID uuid.UUID, input 
 		var buffer strings.Builder
 		finalModel := chat.Model
 
-		for {
+		for chunkCh != nil || errCh != nil {
 			select {
 			case chunk, ok := <-chunkCh:
 				if !ok {
-					// Stream context closed gracefully. Save the assistant message.
-					if buffer.Len() > 0 {
-						assistantMsg := &domain.Message{
-							ID:        uuid.New(),
-							ChatID:    chatID,
-							Role:      domain.RoleAssistant,
-							Content:   buffer.String(),
-							Model:     finalModel,
-							CreatedAt: time.Now(),
-						}
-						// Async context background so it saves even if original ctx canceled
-						if err := s.messageRepo.Create(context.Background(), assistantMsg); err != nil {
-							s.log.ErrorContext(context.Background(), "failed to persist assistant message", "chat_id", chatID, "message_id", assistantMsg.ID, "error", err)
-						}
-					}
-					return
+					chunkCh = nil
+					continue
 				}
 
 				if chunk.Model != "" {
@@ -412,43 +403,37 @@ func (s *ChatService) FacadeStream(ctx context.Context, userID uuid.UUID, input 
 				}
 
 			case err, ok := <-errCh:
-				if ok && err != nil {
+				if !ok {
+					errCh = nil
+					continue
+				}
+				if err != nil {
 					outErr <- err
 					s.log.ErrorContext(ctx, "facade stream interrupted by err", "error", err)
 				}
-				// Save partial if there's anything
-				if buffer.Len() > 0 {
-					assistantMsg := &domain.Message{
-						ID:        uuid.New(),
-						ChatID:    chatID,
-						Role:      domain.RoleAssistant,
-						Content:   buffer.String(),
-						Model:     finalModel,
-						CreatedAt: time.Now(),
-					}
-					if err := s.messageRepo.Create(context.Background(), assistantMsg); err != nil {
-						s.log.ErrorContext(context.Background(), "failed to persist assistant message", "chat_id", chatID, "message_id", assistantMsg.ID, "error", err)
-					}
-				}
-				return
 				
 			case <-ctx.Done():
 				outErr <- ctx.Err()
-				if buffer.Len() > 0 {
-					assistantMsg := &domain.Message{
-						ID:        uuid.New(),
-						ChatID:    chatID,
-						Role:      domain.RoleAssistant,
-						Content:   buffer.String(),
-						Model:     finalModel,
-						CreatedAt: time.Now(),
-					}
-					if err := s.messageRepo.Create(context.Background(), assistantMsg); err != nil {
-						s.log.ErrorContext(context.Background(), "failed to persist assistant message", "chat_id", chatID, "message_id", assistantMsg.ID, "error", err)
-					}
-				}
-				return
+				chunkCh = nil
+				errCh = nil // Force exit loop
 			}
+		}
+
+		if buffer.Len() > 0 {
+			assistantMsg := &domain.Message{
+				ID:        uuid.New(),
+				ChatID:    chatID,
+				Role:      domain.RoleAssistant,
+				Content:   buffer.String(),
+				Model:     finalModel,
+				CreatedAt: time.Now(),
+			}
+
+			persistCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := s.messageRepo.Create(persistCtx, assistantMsg); err != nil {
+				s.log.ErrorContext(persistCtx, "failed to persist assistant message", "chat_id", chatID, "message_id", assistantMsg.ID, "error", err)
+			}
+			cancel()
 		}
 	}()
 
