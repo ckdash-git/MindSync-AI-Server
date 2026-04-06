@@ -12,9 +12,10 @@ import (
 
 // RateLimitConfig holds per-endpoint-type rate limit settings.
 type RateLimitConfig struct {
-	AuthRPM   int // requests per minute for auth endpoints
-	ChatRPM   int // requests per minute for chat endpoints
-	StreamRPM int // requests per minute for streaming endpoints
+	AuthRPM    int // requests per minute for auth endpoints
+	ChatRPM    int // requests per minute for chat endpoints
+	StreamRPM  int // requests per minute for streaming endpoints
+	CouncilRPM int // requests per minute for council endpoints
 }
 
 // RateLimiter implements per-user/IP rate limiting with token bucket algorithm.
@@ -117,6 +118,8 @@ func (rl *RateLimiter) getRPM(endpointType string) int {
 		return rl.config.AuthRPM
 	case "stream":
 		return rl.config.StreamRPM
+	case "council":
+		return rl.config.CouncilRPM
 	default:
 		return rl.config.ChatRPM
 	}

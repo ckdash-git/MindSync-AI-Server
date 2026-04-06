@@ -77,16 +77,17 @@ func main() {
 	middleware.SetAuthMiddleware(authMiddleware)
 
 	rateLimiter := middleware.NewRateLimiter(middleware.RateLimitConfig{
-		AuthRPM:   cfg.RateLimit.AuthRPM,
-		ChatRPM:   cfg.RateLimit.ChatRPM,
-		StreamRPM: cfg.RateLimit.StreamRPM,
+		AuthRPM:    cfg.RateLimit.AuthRPM,
+		ChatRPM:    cfg.RateLimit.ChatRPM,
+		StreamRPM:  cfg.RateLimit.StreamRPM,
+		CouncilRPM: cfg.RateLimit.CouncilRPM,
 	})
 
 	// ── Initialize Handlers ────────────────────────────────────────────
 	authHandler := handler.NewAuthHandler(authService, log)
 	chatHandler := handler.NewChatHandler(chatService, log)
 	streamHandler := handler.NewStreamHandler(streamService, cfg.OpenRouter.DefaultModel, log)
-	facadeHandler := handler.NewFacadeHandler(chatService, cfg.OpenRouter.DefaultModel, rateLimiter, log)
+	facadeHandler := handler.NewFacadeHandler(chatService, streamService, cfg.OpenRouter.DefaultModel, rateLimiter, log)
 
 	// ── Initialize Router ──────────────────────────────────────────────
 	r := chi.NewRouter()
