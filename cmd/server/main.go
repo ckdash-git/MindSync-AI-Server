@@ -86,7 +86,7 @@ func main() {
 	authHandler := handler.NewAuthHandler(authService, log)
 	chatHandler := handler.NewChatHandler(chatService, log)
 	streamHandler := handler.NewStreamHandler(streamService, cfg.OpenRouter.DefaultModel, log)
-	facadeHandler := handler.NewFacadeHandler(chatService, cfg.OpenRouter.DefaultModel, rateLimiter, log)
+	facadeHandler := handler.NewFacadeHandler(chatService, streamService, cfg.OpenRouter.DefaultModel, rateLimiter, log)
 
 	// ── Initialize Router ──────────────────────────────────────────────
 	r := chi.NewRouter()

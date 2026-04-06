@@ -20,9 +20,19 @@ type FacadeChatInput struct {
 	APIKey  string
 }
 
+// truncateTitle limits a string to maxLen characters, appending "..." if truncated safely.
+func truncateTitle(s string, maxLen int) string {
+	runes := []rune(s)
+	if len(runes) <= maxLen {
+		return s
+	}
+	return string(runes[:maxLen]) + "..."
+}
+
 // FacadeChat handles the logic for a simplified chat, reusing a chat if provided.
 func (s *ChatService) FacadeChat(ctx context.Context, userID uuid.UUID, input FacadeChatInput) (*SendMessageResult, uuid.UUID, error) {
 	var chatID uuid.UUID
+	var result *SendMessageResult
 
 	if input.ChatID != nil {
 		chatID = *input.ChatID
@@ -34,29 +44,31 @@ func (s *ChatService) FacadeChat(ctx context.Context, userID uuid.UUID, input Fa
 		if chat.UserID != userID {
 			return nil, uuid.Nil, domain.ErrForbidden
 		}
-	} else {
-		// Auto-generate title
-		title := input.Message
-		if len(title) > 50 {
-			title = title[:50] + "..."
-		}
 
-		chat, err := s.CreateChat(ctx, userID, CreateChatInput{
-			Title: title,
-			Model: input.Model,
+		result, err = s.SendMessage(ctx, userID, chatID, SendMessageInput{
+			Content: input.Message,
+			APIKey:  input.APIKey,
 		})
 		if err != nil {
-			return nil, uuid.Nil, fmt.Errorf("creating chat: %w", err)
+			return nil, chatID, err
+		}
+	} else {
+		// Auto-generate title
+		title := truncateTitle(input.Message, 50)
+
+		var err error
+		var chat *domain.Chat
+		chat, result, err = s.CreateChatAndSendFirstMessage(ctx, userID, CreateChatInput{
+			Title: title,
+			Model: input.Model,
+		}, SendMessageInput{
+			Content: input.Message,
+			APIKey:  input.APIKey,
+		})
+		if err != nil {
+			return nil, uuid.Nil, fmt.Errorf("creating chat and sending msg: %w", err)
 		}
 		chatID = chat.ID
-	}
-
-	result, err := s.SendMessage(ctx, userID, chatID, SendMessageInput{
-		Content: input.Message,
-		APIKey:  input.APIKey,
-	})
-	if err != nil {
-		return nil, chatID, err
 	}
 
 	return result, chatID, nil
@@ -71,18 +83,7 @@ type ExplainInput struct {
 
 // Explain injects a system prompt and fetches an explanation for the given topic.
 func (s *ChatService) Explain(ctx context.Context, userID uuid.UUID, input ExplainInput) (*SendMessageResult, error) {
-	title := fmt.Sprintf("Explain: %s", input.Topic)
-	if len(title) > 50 {
-		title = title[:50] + "..."
-	}
-
-	chat, err := s.CreateChat(ctx, userID, CreateChatInput{
-		Title: title,
-		Model: input.Model,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("creating chat: %w", err)
-	}
+	title := truncateTitle(fmt.Sprintf("Explain: %s", input.Topic), 50)
 
 	prompt := fmt.Sprintf(
 		"You are a clear, concise explainer. Explain the following topic in a way that is "+
@@ -90,10 +91,19 @@ func (s *ChatService) Explain(ctx context.Context, userID uuid.UUID, input Expla
 			"Topic: %s", input.Topic,
 	)
 
-	return s.SendMessage(ctx, userID, chat.ID, SendMessageInput{
+	_, result, err := s.CreateChatAndSendFirstMessage(ctx, userID, CreateChatInput{
+		Title: title,
+		Model: input.Model,
+	}, SendMessageInput{
 		Content: prompt,
 		APIKey:  input.APIKey,
+		Role:    domain.RoleSystem,
 	})
+	if err != nil {
+		return nil, fmt.Errorf("creating chat and sending msg: %w", err)
+	}
+
+	return result, nil
 }
 
 // AICouncilInput contains parameters for the ai-council endpoint.
@@ -119,6 +129,34 @@ type AICouncilResult struct {
 
 // AICouncil fans out the question to multiple models concurrently and synthesizes a final answer.
 func (s *ChatService) AICouncil(ctx context.Context, userID uuid.UUID, input AICouncilInput) (*AICouncilResult, error) {
+	// Sanitize and deduplicate models
+	models := input.Models
+	if len(models) == 0 {
+		models = []string{
+			"openai/gpt-4o",
+			"anthropic/claude-3.5-sonnet",
+			"google/gemini-pro",
+		}
+	}
+
+	seen := make(map[string]struct{}, len(models))
+	filtered := make([]string, 0, len(models))
+	for _, m := range models {
+		m = strings.TrimSpace(m)
+		if m == "" {
+			return nil, domain.NewValidationError("models", "models must not contain empty values")
+		}
+		if _, ok := seen[m]; ok {
+			continue
+		}
+		seen[m] = struct{}{}
+		filtered = append(filtered, m)
+	}
+	if len(filtered) > 5 {
+		return nil, domain.NewValidationError("models", "at most 5 models are supported")
+	}
+	input.Models = filtered
+
 	// Enforce an overall timeout of structured 2 minutes
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
@@ -126,10 +164,7 @@ func (s *ChatService) AICouncil(ctx context.Context, userID uuid.UUID, input AIC
 	var wg sync.WaitGroup
 	opinions := make([]CouncilOpinion, len(input.Models))
 
-	title := fmt.Sprintf("Council: %s", input.Question)
-	if len(title) > 50 {
-		title = title[:50] + "..."
-	}
+	title := truncateTitle(fmt.Sprintf("Council: %s", input.Question), 50)
 
 	for i, m := range input.Models {
 		wg.Add(1)
@@ -137,25 +172,17 @@ func (s *ChatService) AICouncil(ctx context.Context, userID uuid.UUID, input AIC
 			defer wg.Done()
 			opinion := CouncilOpinion{Model: model}
 
-			chat, err := s.CreateChat(ctx, userID, CreateChatInput{
+			_, result, err := s.CreateChatAndSendFirstMessage(ctx, userID, CreateChatInput{
 				Title: fmt.Sprintf("%s [%s]", title, model),
 				Model: model,
-			})
-			if err != nil {
-				opinion.Error = "failed to create chat"
-				opinions[idx] = opinion
-				s.log.ErrorContext(ctx, "council step failed to create chat", "error", err)
-				return
-			}
-
-			result, err := s.SendMessage(ctx, userID, chat.ID, SendMessageInput{
+			}, SendMessageInput{
 				Content: input.Question,
 				APIKey:  input.APIKey,
 			})
 			if err != nil {
-				opinion.Error = "model failed to respond"
+				opinion.Error = "model failed to respond or chat creation failed"
 				opinions[idx] = opinion
-				s.log.ErrorContext(ctx, "council model failed", "model", model, "error", err)
+				s.log.ErrorContext(ctx, "council step failed", "model", model, "error", err)
 				return
 			}
 
@@ -249,18 +276,18 @@ func (s *ChatService) SessionSummary(ctx context.Context, userID uuid.UUID, inpu
 		summaryModel = chat.Model
 	}
 
-	summaryChat, err := s.CreateChat(ctx, userID, CreateChatInput{
-		Title: fmt.Sprintf("Summary: %s", chat.Title),
+	_, result, err := s.CreateChatAndSendFirstMessage(ctx, userID, CreateChatInput{
+		Title: truncateTitle(fmt.Sprintf("Summary: %s", chat.Title), 50),
 		Model: summaryModel,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return s.SendMessage(ctx, userID, summaryChat.ID, SendMessageInput{
+	}, SendMessageInput{
 		Content: sb.String(),
 		APIKey:  input.APIKey,
 	})
+	if err != nil {
+		return nil, fmt.Errorf("creating summary chat and msg: %w", err)
+	}
+
+	return result, nil
 }
 
 // FacadeStreamInput contains parameters for the streaming endpoint.
@@ -288,10 +315,7 @@ func (s *ChatService) FacadeStream(ctx context.Context, userID uuid.UUID, input 
 		}
 		chat = c
 	} else {
-		title := input.Message
-		if len(title) > 50 {
-			title = title[:50] + "..."
-		}
+		title := truncateTitle(input.Message, 50)
 		c, err := s.CreateChat(ctx, userID, CreateChatInput{
 			Title: title,
 			Model: input.Model,

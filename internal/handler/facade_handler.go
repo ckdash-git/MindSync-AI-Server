@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
-	"sync"
 
 	"github.com/ckdash-git/MindSync-AI-Server/internal/domain"
 	"github.com/ckdash-git/MindSync-AI-Server/internal/logger"
@@ -17,50 +15,44 @@ import (
 	"github.com/google/uuid"
 )
 
-// defaultCouncilModels defines the default models for the AI council endpoint.
-var defaultCouncilModels = []string{
-	"openai/gpt-4o",
-	"anthropic/claude-3.5-sonnet",
-	"google/gemini-pro",
-}
-
 // FacadeHandler provides simplified, single-request endpoints that compose
-// existing ChatService operations into convenient client-facing APIs.
+// existing service operations into convenient client-facing APIs.
 type FacadeHandler struct {
-	chatService  *service.ChatService
-	defaultModel string
-	rateLimiter  *middleware.RateLimiter
-	log          *logger.Logger
+	chatService   *service.ChatService
+	streamService *service.StreamService
+	defaultModel  string
+	rateLimiter   *middleware.RateLimiter
+	log           *logger.Logger
 }
 
 // NewFacadeHandler creates a new FacadeHandler.
-func NewFacadeHandler(chatService *service.ChatService, defaultModel string, rateLimiter *middleware.RateLimiter, log *logger.Logger) *FacadeHandler {
+func NewFacadeHandler(chatService *service.ChatService, streamService *service.StreamService, defaultModel string, rateLimiter *middleware.RateLimiter, log *logger.Logger) *FacadeHandler {
 	return &FacadeHandler{
-		chatService:  chatService,
-		defaultModel: defaultModel,
-		rateLimiter:  rateLimiter,
-		log:          log,
+		chatService:   chatService,
+		streamService: streamService,
+		defaultModel:  defaultModel,
+		rateLimiter:   rateLimiter,
+		log:           log,
 	}
 }
 
 // RegisterRoutes registers the simplified façade routes on the given router.
 func (h *FacadeHandler) RegisterRoutes(r chi.Router) {
 	r.With(middleware.RequireAuth, h.rateLimiter.Handler("chat")).Post("/chat", h.SimpleChat)
+	r.With(middleware.RequireAuth, h.rateLimiter.Handler("stream")).Post("/chat/stream", h.StreamChat)
 	r.With(middleware.RequireAuth, h.rateLimiter.Handler("chat")).Post("/explain", h.Explain)
-	r.With(middleware.RequireAuth, h.rateLimiter.Handler("chat")).Post("/ai-council", h.AICouncil)
+	r.With(middleware.RequireAuth, h.rateLimiter.Handler("council")).Post("/ai-council", h.AICouncil)
 	r.With(middleware.RequireAuth, h.rateLimiter.Handler("chat")).Post("/session/summary", h.SessionSummary)
 }
 
 // ── Request / Response Types ────────────────────────────────────────────────
 
-// SimpleChatRequest is the request body for POST /api/v1/chat.
 type SimpleChatRequest struct {
+	ChatID  string `json:"chat_id,omitempty"`
 	Message string `json:"message"`
 	Model   string `json:"model,omitempty"`
-	APIKey  string `json:"api_key"`
 }
 
-// SimpleChatResponse is the response for POST /api/v1/chat.
 type SimpleChatResponse struct {
 	ChatID   string `json:"chat_id"`
 	Response string `json:"response"`
@@ -68,14 +60,17 @@ type SimpleChatResponse struct {
 	Tokens   int    `json:"tokens_used"`
 }
 
-// ExplainRequest is the request body for POST /api/v1/explain.
-type ExplainRequest struct {
-	Topic  string `json:"topic"`
-	Model  string `json:"model,omitempty"`
-	APIKey string `json:"api_key"`
+type StreamChatRequest struct {
+	ChatID  string `json:"chat_id,omitempty"`
+	Message string `json:"message"`
+	Model   string `json:"model,omitempty"`
 }
 
-// ExplainResponse is the response for POST /api/v1/explain.
+type ExplainRequest struct {
+	Topic string `json:"topic"`
+	Model string `json:"model,omitempty"`
+}
+
 type ExplainResponse struct {
 	Topic       string `json:"topic"`
 	Explanation string `json:"explanation"`
@@ -83,35 +78,16 @@ type ExplainResponse struct {
 	Tokens      int    `json:"tokens_used"`
 }
 
-// AICouncilRequest is the request body for POST /api/v1/ai-council.
 type AICouncilRequest struct {
 	Question string   `json:"question"`
 	Models   []string `json:"models,omitempty"`
-	APIKey   string   `json:"api_key"`
 }
 
-// CouncilOpinion holds a single model's response within the council.
-type CouncilOpinion struct {
-	Model    string `json:"model"`
-	Response string `json:"response"`
-	Tokens   int    `json:"tokens_used"`
-	Error    string `json:"error,omitempty"`
-}
-
-// AICouncilResponse is the response for POST /api/v1/ai-council.
-type AICouncilResponse struct {
-	Question string           `json:"question"`
-	Opinions []CouncilOpinion `json:"opinions"`
-}
-
-// SessionSummaryRequest is the request body for POST /api/v1/session/summary.
 type SessionSummaryRequest struct {
 	ChatID string `json:"chat_id"`
 	Model  string `json:"model,omitempty"`
-	APIKey string `json:"api_key"`
 }
 
-// SessionSummaryResponse is the response for POST /api/v1/session/summary.
 type SessionSummaryResponse struct {
 	ChatID  string `json:"chat_id"`
 	Summary string `json:"summary"`
@@ -119,14 +95,39 @@ type SessionSummaryResponse struct {
 	Tokens  int    `json:"tokens_used"`
 }
 
+// ── Shared Helpers ──────────────────────────────────────────────────────────
+
+func (h *FacadeHandler) extractAPIKey(w http.ResponseWriter, r *http.Request) (string, bool) {
+	apiKey := r.Header.Get("X-OpenRouter-Key")
+	if apiKey == "" {
+		response.Error(w, http.StatusUnauthorized, "MISSING_API_KEY", "X-OpenRouter-Key header is required")
+		return "", false
+	}
+	return apiKey, true
+}
+
+func parseOptionalChatID(idStr string) (*uuid.UUID, error) {
+	if idStr == "" {
+		return nil, nil
+	}
+	parsed, err := uuid.Parse(idStr)
+	if err != nil {
+		return nil, err
+	}
+	return &parsed, nil
+}
+
 // ── Handlers ────────────────────────────────────────────────────────────────
 
-// SimpleChat handles POST /api/v1/chat.
-// It creates a transient chat, sends the user message, and returns the AI response.
 func (h *FacadeHandler) SimpleChat(w http.ResponseWriter, r *http.Request) {
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok {
 		response.Unauthorized(w, "not authenticated")
+		return
+	}
+
+	apiKey, ok := h.extractAPIKey(w, r)
+	if !ok {
 		return
 	}
 
@@ -140,8 +141,10 @@ func (h *FacadeHandler) SimpleChat(w http.ResponseWriter, r *http.Request) {
 		response.BadRequest(w, "message is required")
 		return
 	}
-	if req.APIKey == "" {
-		response.BadRequest(w, "api_key is required")
+
+	chatID, err := parseOptionalChatID(req.ChatID)
+	if err != nil {
+		response.BadRequest(w, "invalid chat_id format")
 		return
 	}
 
@@ -150,39 +153,128 @@ func (h *FacadeHandler) SimpleChat(w http.ResponseWriter, r *http.Request) {
 		model = h.defaultModel
 	}
 
-	// Auto-generate a title from the first 50 characters of the message.
-	title := truncate(req.Message, 50)
-
-	// Step 1: Create a chat and send the first message atomically.
-	chat, result, err := h.chatService.CreateChatAndSendFirstMessage(r.Context(), claims.UserID,
-		service.CreateChatInput{
-			Title: title,
-			Model: model,
-		},
-		service.SendMessageInput{
-			Content: req.Message,
-			APIKey:  req.APIKey,
-		},
-	)
+	result, newChatID, err := h.chatService.FacadeChat(r.Context(), claims.UserID, service.FacadeChatInput{
+		ChatID:  chatID,
+		Message: req.Message,
+		Model:   model,
+		APIKey:  apiKey,
+	})
 	if err != nil {
 		h.handleError(w, r, err)
 		return
 	}
 
 	response.OK(w, SimpleChatResponse{
-		ChatID:   chat.ID.String(),
+		ChatID:   newChatID.String(),
 		Response: result.AssistantMessage.Content,
 		Model:    result.AssistantMessage.Model,
 		Tokens:   result.AssistantMessage.TokensUsed,
 	})
 }
 
-// Explain handles POST /api/v1/explain.
-// It creates a chat with an "explain" system prompt and returns the explanation.
+func (h *FacadeHandler) StreamChat(w http.ResponseWriter, r *http.Request) {
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok {
+		response.Unauthorized(w, "not authenticated")
+		return
+	}
+
+	apiKey, ok := h.extractAPIKey(w, r)
+	if !ok {
+		return
+	}
+
+	var req StreamChatRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.BadRequest(w, "invalid request body")
+		return
+	}
+	if req.Message == "" {
+		response.BadRequest(w, "message is required")
+		return
+	}
+
+	chatID, err := parseOptionalChatID(req.ChatID)
+	if err != nil {
+		response.BadRequest(w, "invalid chat_id format")
+		return
+	}
+
+	model := req.Model
+	if model == "" {
+		model = h.defaultModel
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		h.log.ErrorContext(r.Context(), "response writer does not support flushing")
+		response.InternalError(w)
+		return
+	}
+
+	chunkCh, errCh, finalChatID, err := h.chatService.FacadeStream(r.Context(), claims.UserID, service.FacadeStreamInput{
+		ChatID:  chatID,
+		Message: req.Message,
+		Model:   model,
+		APIKey:  apiKey,
+	}, h.streamService)
+
+	if err != nil {
+		header := map[string]string{"message": "failed to start stream"}
+		headerData, _ := json.Marshal(header)
+		fmt.Fprintf(w, "event: error\ndata: %s\n\n", headerData)
+		flusher.Flush()
+		h.handleError(w, r, err)
+		return
+	}
+
+	// First chunk will carry the chat_id so client knows it
+	initData, _ := json.Marshal(map[string]string{"chat_id": finalChatID})
+	fmt.Fprintf(w, "event: init\ndata: %s\n\n", initData)
+	flusher.Flush()
+
+	for {
+		select {
+		case chunk, ok := <-chunkCh:
+			if !ok {
+				fmt.Fprintf(w, "data: [DONE]\n\n")
+				flusher.Flush()
+				return
+			}
+			data, _ := json.Marshal(chunk)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+
+		case err, ok := <-errCh:
+			if ok && err != nil {
+				h.log.ErrorContext(r.Context(), "stream error", "error", err)
+				errData, _ := json.Marshal(map[string]string{"message": "stream error"})
+				fmt.Fprintf(w, "event: error\ndata: %s\n\n", errData)
+				flusher.Flush()
+			}
+			return
+
+		case <-r.Context().Done():
+			h.log.InfoContext(r.Context(), "client disconnected during stream")
+			return
+		}
+	}
+}
+
 func (h *FacadeHandler) Explain(w http.ResponseWriter, r *http.Request) {
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok {
 		response.Unauthorized(w, "not authenticated")
+		return
+	}
+
+	apiKey, ok := h.extractAPIKey(w, r)
+	if !ok {
 		return
 	}
 
@@ -196,37 +288,17 @@ func (h *FacadeHandler) Explain(w http.ResponseWriter, r *http.Request) {
 		response.BadRequest(w, "topic is required")
 		return
 	}
-	if req.APIKey == "" {
-		response.BadRequest(w, "api_key is required")
-		return
-	}
 
 	model := req.Model
 	if model == "" {
 		model = h.defaultModel
 	}
 
-	title := fmt.Sprintf("Explain: %s", truncate(req.Topic, 40))
-
-	// Compose the explain prompt.
-	prompt := fmt.Sprintf(
-		"You are a clear, concise explainer. Explain the following topic in a way that is "+
-			"easy to understand. Use examples where helpful. Be thorough but not verbose.\n\n"+
-			"Topic: %s", req.Topic,
-	)
-
-	// Create a chat and send the explain prompt atomically.
-	_, result, err := h.chatService.CreateChatAndSendFirstMessage(r.Context(), claims.UserID,
-		service.CreateChatInput{
-			Title: title,
-			Model: model,
-		},
-		service.SendMessageInput{
-			Content: prompt,
-			APIKey:  req.APIKey,
-			Role:    domain.RoleSystem, // Important: explicitly inject as system prompt
-		},
-	)
+	result, err := h.chatService.Explain(r.Context(), claims.UserID, service.ExplainInput{
+		Topic:  req.Topic,
+		Model:  model,
+		APIKey: apiKey,
+	})
 	if err != nil {
 		h.handleError(w, r, err)
 		return
@@ -240,12 +312,15 @@ func (h *FacadeHandler) Explain(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// AICouncil handles POST /api/v1/ai-council.
-// It sends the same question to multiple AI models concurrently and returns all responses.
 func (h *FacadeHandler) AICouncil(w http.ResponseWriter, r *http.Request) {
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok {
 		response.Unauthorized(w, "not authenticated")
+		return
+	}
+
+	apiKey, ok := h.extractAPIKey(w, r)
+	if !ok {
 		return
 	}
 
@@ -259,88 +334,38 @@ func (h *FacadeHandler) AICouncil(w http.ResponseWriter, r *http.Request) {
 		response.BadRequest(w, "question is required")
 		return
 	}
-	if req.APIKey == "" {
-		response.BadRequest(w, "api_key is required")
-		return
-	}
 
 	models := req.Models
 	if len(models) == 0 {
-		models = append([]string(nil), defaultCouncilModels...)
+		models = []string{
+			"openai/gpt-4o",
+			"anthropic/claude-3.5-sonnet",
+			"google/gemini-pro",
+		}
 	}
 
-	seen := make(map[string]struct{}, len(models))
-	filtered := make([]string, 0, len(models))
-	for _, m := range models {
-		m = strings.TrimSpace(m)
-		if m == "" {
-			response.BadRequest(w, "models must not contain empty values")
-			return
-		}
-		if _, ok := seen[m]; ok {
-			continue
-		}
-		seen[m] = struct{}{}
-		filtered = append(filtered, m)
-	}
-	if len(filtered) > 5 {
-		response.BadRequest(w, "at most 5 models are supported")
+	result, err := h.chatService.AICouncil(r.Context(), claims.UserID, service.AICouncilInput{
+		Question: req.Question,
+		Models:   models,
+		APIKey:   apiKey,
+	})
+	if err != nil {
+		h.handleError(w, r, err)
 		return
 	}
-	models = filtered
 
-	title := fmt.Sprintf("Council: %s", truncate(req.Question, 40))
-
-	// Fan-out: query each model concurrently.
-	var wg sync.WaitGroup
-	opinions := make([]CouncilOpinion, len(models))
-
-	for i, model := range models {
-		wg.Add(1)
-		go func(idx int, m string) {
-			defer wg.Done()
-
-			opinion := CouncilOpinion{Model: m}
-
-			// Each model gets its own chat, performed atomically.
-			_, result, err := h.chatService.CreateChatAndSendFirstMessage(r.Context(), claims.UserID,
-				service.CreateChatInput{
-					Title: fmt.Sprintf("%s [%s]", title, m),
-					Model: m,
-				},
-				service.SendMessageInput{
-					Content: req.Question,
-					APIKey:  req.APIKey,
-				},
-			)
-			if err != nil {
-				opinion.Error = "model failed to respond"
-				h.log.ErrorContext(r.Context(), "council: exchange failed",
-					"model", m, "error", err)
-				opinions[idx] = opinion
-				return
-			}
-
-			opinion.Response = result.AssistantMessage.Content
-			opinion.Tokens = result.AssistantMessage.TokensUsed
-			opinions[idx] = opinion
-		}(i, model)
-	}
-
-	wg.Wait()
-
-	response.OK(w, AICouncilResponse{
-		Question: req.Question,
-		Opinions: opinions,
-	})
+	response.OK(w, result) // Wraps successfully with response format
 }
 
-// SessionSummary handles POST /api/v1/session/summary.
-// It retrieves the message history of a chat and generates a summary.
 func (h *FacadeHandler) SessionSummary(w http.ResponseWriter, r *http.Request) {
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok {
 		response.Unauthorized(w, "not authenticated")
+		return
+	}
+
+	apiKey, ok := h.extractAPIKey(w, r)
+	if !ok {
 		return
 	}
 
@@ -354,61 +379,18 @@ func (h *FacadeHandler) SessionSummary(w http.ResponseWriter, r *http.Request) {
 		response.BadRequest(w, "chat_id is required")
 		return
 	}
-	if req.APIKey == "" {
-		response.BadRequest(w, "api_key is required")
-		return
-	}
 
-	model := req.Model
-	if model == "" {
-		model = h.defaultModel
-	}
-
-	chatID, err := parseUUID(req.ChatID)
+	chatID, err := uuid.Parse(req.ChatID)
 	if err != nil {
 		response.BadRequest(w, "invalid chat_id format")
 		return
 	}
 
-	// Get the chat and its message history.
-	chat, messages, err := h.chatService.GetChat(r.Context(), claims.UserID, chatID)
-	if err != nil {
-		h.handleError(w, r, err)
-		return
-	}
-
-	if len(messages) == 0 {
-		response.BadRequest(w, "chat has no messages to summarize")
-		return
-	}
-
-	// Build a transcript from the message history.
-	var sb strings.Builder
-	sb.WriteString("Summarize the following conversation concisely. ")
-	sb.WriteString("Highlight key topics, decisions, and action items.\n\n")
-	sb.WriteString("--- Conversation ---\n")
-	for _, msg := range messages {
-		sb.WriteString(fmt.Sprintf("[%s]: %s\n", msg.Role, msg.Content))
-	}
-	sb.WriteString("--- End ---\n\n")
-	sb.WriteString("Provide a structured summary.")
-
-	// Create a summary chat with the same model the original chat used (or override).
-	summaryModel := model
-	if chat.Model != "" && req.Model == "" {
-		summaryModel = chat.Model
-	}
-
-	_, result, err := h.chatService.CreateChatAndSendFirstMessage(r.Context(), claims.UserID,
-		service.CreateChatInput{
-			Title: fmt.Sprintf("Summary: %s", truncate(chat.Title, 40)),
-			Model: summaryModel,
-		},
-		service.SendMessageInput{
-			Content: sb.String(),
-			APIKey:  req.APIKey,
-		},
-	)
+	result, err := h.chatService.SessionSummary(r.Context(), claims.UserID, service.SessionSummaryInput{
+		ChatID: chatID,
+		Model:  req.Model,
+		APIKey: apiKey,
+	})
 	if err != nil {
 		h.handleError(w, r, err)
 		return
@@ -421,8 +403,6 @@ func (h *FacadeHandler) SessionSummary(w http.ResponseWriter, r *http.Request) {
 		Tokens:  result.AssistantMessage.TokensUsed,
 	})
 }
-
-// ── Helpers ─────────────────────────────────────────────────────────────────
 
 // handleError maps domain errors to HTTP responses.
 func (h *FacadeHandler) handleError(w http.ResponseWriter, r *http.Request, err error) {
@@ -450,16 +430,3 @@ func (h *FacadeHandler) handleError(w http.ResponseWriter, r *http.Request, err 
 	}
 }
 
-// truncate limits a string to maxLen characters, appending "..." if truncated.
-func truncate(s string, maxLen int) string {
-	runes := []rune(s)
-	if len(runes) <= maxLen {
-		return s
-	}
-	return string(runes[:maxLen]) + "..."
-}
-
-// parseUUID parses a string into a uuid.UUID.
-func parseUUID(s string) (uuid.UUID, error) {
-	return uuid.Parse(s)
-}
