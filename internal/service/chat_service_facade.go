@@ -1,0 +1,426 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/ckdash-git/MindSync-AI-Server/internal/domain"
+	"github.com/ckdash-git/MindSync-AI-Server/internal/openrouter"
+	"github.com/google/uuid"
+)
+
+// FacadeChatInput contains parameters for the simplified chat endpoint.
+type FacadeChatInput struct {
+	ChatID  *uuid.UUID
+	Message string
+	Model   string
+	APIKey  string
+}
+
+// FacadeChat handles the logic for a simplified chat, reusing a chat if provided.
+func (s *ChatService) FacadeChat(ctx context.Context, userID uuid.UUID, input FacadeChatInput) (*SendMessageResult, uuid.UUID, error) {
+	var chatID uuid.UUID
+
+	if input.ChatID != nil {
+		chatID = *input.ChatID
+		// Verify existence and ownership
+		chat, err := s.chatRepo.GetByID(ctx, chatID)
+		if err != nil {
+			return nil, uuid.Nil, fmt.Errorf("invalid chat_id: %w", err)
+		}
+		if chat.UserID != userID {
+			return nil, uuid.Nil, domain.ErrForbidden
+		}
+	} else {
+		// Auto-generate title
+		title := input.Message
+		if len(title) > 50 {
+			title = title[:50] + "..."
+		}
+
+		chat, err := s.CreateChat(ctx, userID, CreateChatInput{
+			Title: title,
+			Model: input.Model,
+		})
+		if err != nil {
+			return nil, uuid.Nil, fmt.Errorf("creating chat: %w", err)
+		}
+		chatID = chat.ID
+	}
+
+	result, err := s.SendMessage(ctx, userID, chatID, SendMessageInput{
+		Content: input.Message,
+		APIKey:  input.APIKey,
+	})
+	if err != nil {
+		return nil, chatID, err
+	}
+
+	return result, chatID, nil
+}
+
+// ExplainInput contains parameters for the explain endpoint.
+type ExplainInput struct {
+	Topic  string
+	Model  string
+	APIKey string
+}
+
+// Explain injects a system prompt and fetches an explanation for the given topic.
+func (s *ChatService) Explain(ctx context.Context, userID uuid.UUID, input ExplainInput) (*SendMessageResult, error) {
+	title := fmt.Sprintf("Explain: %s", input.Topic)
+	if len(title) > 50 {
+		title = title[:50] + "..."
+	}
+
+	chat, err := s.CreateChat(ctx, userID, CreateChatInput{
+		Title: title,
+		Model: input.Model,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("creating chat: %w", err)
+	}
+
+	prompt := fmt.Sprintf(
+		"You are a clear, concise explainer. Explain the following topic in a way that is "+
+			"easy to understand. Use examples where helpful. Be thorough but not verbose.\n\n"+
+			"Topic: %s", input.Topic,
+	)
+
+	return s.SendMessage(ctx, userID, chat.ID, SendMessageInput{
+		Content: prompt,
+		APIKey:  input.APIKey,
+	})
+}
+
+// AICouncilInput contains parameters for the ai-council endpoint.
+type AICouncilInput struct {
+	Question string
+	Models   []string
+	APIKey   string
+}
+
+// CouncilOpinion holds a single model's response within the council.
+type CouncilOpinion struct {
+	Model    string `json:"model"`
+	Response string `json:"output"`
+	Tokens   int    `json:"-"`
+	Error    string `json:"error,omitempty"`
+}
+
+// AICouncilResult is the result of the AI council request.
+type AICouncilResult struct {
+	Opinions    []CouncilOpinion
+	FinalAnswer string
+}
+
+// AICouncil fans out the question to multiple models concurrently and synthesizes a final answer.
+func (s *ChatService) AICouncil(ctx context.Context, userID uuid.UUID, input AICouncilInput) (*AICouncilResult, error) {
+	// Enforce an overall timeout of structured 2 minutes
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	opinions := make([]CouncilOpinion, len(input.Models))
+
+	title := fmt.Sprintf("Council: %s", input.Question)
+	if len(title) > 50 {
+		title = title[:50] + "..."
+	}
+
+	for i, m := range input.Models {
+		wg.Add(1)
+		go func(idx int, model string) {
+			defer wg.Done()
+			opinion := CouncilOpinion{Model: model}
+
+			chat, err := s.CreateChat(ctx, userID, CreateChatInput{
+				Title: fmt.Sprintf("%s [%s]", title, model),
+				Model: model,
+			})
+			if err != nil {
+				opinion.Error = "failed to create chat"
+				opinions[idx] = opinion
+				s.log.ErrorContext(ctx, "council step failed to create chat", "error", err)
+				return
+			}
+
+			result, err := s.SendMessage(ctx, userID, chat.ID, SendMessageInput{
+				Content: input.Question,
+				APIKey:  input.APIKey,
+			})
+			if err != nil {
+				opinion.Error = "model failed to respond"
+				opinions[idx] = opinion
+				s.log.ErrorContext(ctx, "council model failed", "model", model, "error", err)
+				return
+			}
+
+			opinion.Response = result.AssistantMessage.Content
+			opinion.Tokens = result.AssistantMessage.TokensUsed
+			opinions[idx] = opinion
+		}(i, m)
+	}
+
+	wg.Wait()
+
+	// Synthesize final answer combining opinions
+	var validOpinions []CouncilOpinion
+	for _, o := range opinions {
+		if o.Error == "" {
+			validOpinions = append(validOpinions, o)
+		}
+	}
+
+	if len(validOpinions) == 0 {
+		// All models failed
+		return &AICouncilResult{Opinions: opinions, FinalAnswer: "All models failed to provide an answer."}, nil
+	}
+
+	// Request final answer using the first model from the configured models (or default to the first valid one)
+	synthesisModel := input.Models[0]
+
+	synthChat, err := s.CreateChat(ctx, userID, CreateChatInput{
+		Title: fmt.Sprintf("Final: %s", title),
+		Model: synthesisModel,
+	})
+	if err != nil {
+		return &AICouncilResult{Opinions: opinions, FinalAnswer: "Failed to synthesize final answer: " + err.Error()}, nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString("You are a synthesizer. Review the following answers to a question and provide a final, well-reasoned consensus or synthesis.\n\n")
+	sb.WriteString(fmt.Sprintf("Question: %s\n\n", input.Question))
+	for _, o := range validOpinions {
+		sb.WriteString(fmt.Sprintf("--- Idea from model %s ---\n%s\n\n", o.Model, o.Response))
+	}
+
+	res, err := s.SendMessage(ctx, userID, synthChat.ID, SendMessageInput{
+		Content: sb.String(),
+		APIKey:  input.APIKey,
+	})
+	
+	finalAnswer := ""
+	if err != nil {
+		finalAnswer = "Synthesis failed to respond."
+	} else {
+		finalAnswer = res.AssistantMessage.Content
+	}
+
+	return &AICouncilResult{
+		Opinions:    opinions,
+		FinalAnswer: finalAnswer,
+	}, nil
+}
+
+// SessionSummaryInput contains parameters for the session summary endpoint.
+type SessionSummaryInput struct {
+	ChatID uuid.UUID
+	Model  string
+	APIKey string
+}
+
+// SessionSummary delegates rendering a brief summary form the history to the ChatService.
+func (s *ChatService) SessionSummary(ctx context.Context, userID uuid.UUID, input SessionSummaryInput) (*SendMessageResult, error) {
+	chat, messages, err := s.GetChat(ctx, userID, input.ChatID)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(messages) == 0 {
+		return nil, domain.NewValidationError("chat_id", "chat has no messages to summarize")
+	}
+
+	var sb strings.Builder
+	sb.WriteString("Summarize the following conversation concisely. ")
+	sb.WriteString("Highlight key topics, decisions, and action items.\n\n")
+	sb.WriteString("--- Conversation ---\n")
+	for _, msg := range messages {
+		sb.WriteString(fmt.Sprintf("[%s]: %s\n", msg.Role, msg.Content))
+	}
+	sb.WriteString("--- End ---\n\n")
+	sb.WriteString("Provide a structured summary.")
+
+	summaryModel := input.Model
+	if summaryModel == "" {
+		summaryModel = chat.Model
+	}
+
+	summaryChat, err := s.CreateChat(ctx, userID, CreateChatInput{
+		Title: fmt.Sprintf("Summary: %s", chat.Title),
+		Model: summaryModel,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return s.SendMessage(ctx, userID, summaryChat.ID, SendMessageInput{
+		Content: sb.String(),
+		APIKey:  input.APIKey,
+	})
+}
+
+// FacadeStreamInput contains parameters for the streaming endpoint.
+type FacadeStreamInput struct {
+	ChatID  *uuid.UUID
+	Message string
+	Model   string
+	APIKey  string
+}
+
+// FacadeStream handles the streaming lifecycle: DB creation, intercepting stream chunks, 
+// immediately passing them to the client, forming the final message, and saving it to the DB asynchronously.
+func (s *ChatService) FacadeStream(ctx context.Context, userID uuid.UUID, input FacadeStreamInput, streamSvc *StreamService) (<-chan StreamChunk, <-chan error, string, error) {
+	var chatID uuid.UUID
+	var chat *domain.Chat
+
+	if input.ChatID != nil {
+		chatID = *input.ChatID
+		c, err := s.chatRepo.GetByID(ctx, chatID)
+		if err != nil {
+			return nil, nil, "", fmt.Errorf("invalid chat_id: %w", err)
+		}
+		if c.UserID != userID {
+			return nil, nil, "", domain.ErrForbidden
+		}
+		chat = c
+	} else {
+		title := input.Message
+		if len(title) > 50 {
+			title = title[:50] + "..."
+		}
+		c, err := s.CreateChat(ctx, userID, CreateChatInput{
+			Title: title,
+			Model: input.Model,
+		})
+		if err != nil {
+			return nil, nil, "", fmt.Errorf("creating chat: %w", err)
+		}
+		chatID = c.ID
+		chat = c
+	}
+
+	// Save user message first.
+	userMsg := &domain.Message{
+		ID:        uuid.New(),
+		ChatID:    chatID,
+		Role:      domain.RoleUser,
+		Content:   input.Message,
+		CreatedAt: time.Now(),
+	}
+	if err := s.messageRepo.Create(ctx, userMsg); err != nil {
+		return nil, nil, "", fmt.Errorf("saving user msg: %w", err)
+	}
+
+	// Gather history
+	history, err := s.messageRepo.GetByChatID(ctx, chatID, 50, 0)
+	if err != nil {
+		return nil, nil, "", fmt.Errorf("getting history: %w", err)
+	}
+
+	var orMessages []openrouter.Message
+	for _, msg := range history {
+		// Note: The privacy proc processes this in StreamService later, 
+		// but openrouter expects []openrouter.Message at StreamRequest boundary.
+		orMessages = append(orMessages, openrouter.Message{
+			Role:    string(msg.Role),
+			Content: msg.Content,
+		})
+	}
+
+	// Since streamSvc requires raw string slice in messages, we send it off:
+	req := StreamRequest{
+		Model:    chat.Model,
+		Messages: orMessages,
+		APIKey:   input.APIKey,
+	}
+
+	chunkCh, errCh, err := streamSvc.Stream(ctx, req)
+	if err != nil {
+		return nil, nil, "", err
+	}
+
+	outChunk := make(chan StreamChunk, 64)
+	outErr := make(chan error, 1)
+
+	// Intercept chunks asynchronously
+	go func() {
+		defer close(outChunk)
+		defer close(outErr)
+
+		var buffer strings.Builder
+		finalModel := chat.Model
+
+		for {
+			select {
+			case chunk, ok := <-chunkCh:
+				if !ok {
+					// Stream context closed gracefully. Save the assistant message.
+					if buffer.Len() > 0 {
+						assistantMsg := &domain.Message{
+							ID:        uuid.New(),
+							ChatID:    chatID,
+							Role:      domain.RoleAssistant,
+							Content:   buffer.String(),
+							Model:     finalModel,
+							CreatedAt: time.Now(),
+						}
+						// Async context background so it saves even if original ctx canceled
+						_ = s.messageRepo.Create(context.Background(), assistantMsg)
+					}
+					return
+				}
+
+				if chunk.Model != "" {
+					finalModel = chunk.Model
+				}
+				buffer.WriteString(chunk.Content)
+
+				// Pass through
+				select {
+				case outChunk <- chunk:
+				case <-ctx.Done():
+				}
+
+			case err, ok := <-errCh:
+				if ok && err != nil {
+					outErr <- err
+					s.log.ErrorContext(ctx, "facade stream interrupted by err", "error", err)
+				}
+				// Save partial if there's anything
+				if buffer.Len() > 0 {
+					assistantMsg := &domain.Message{
+						ID:        uuid.New(),
+						ChatID:    chatID,
+						Role:      domain.RoleAssistant,
+						Content:   buffer.String(),
+						Model:     finalModel,
+						CreatedAt: time.Now(),
+					}
+					_ = s.messageRepo.Create(context.Background(), assistantMsg)
+				}
+				return
+				
+			case <-ctx.Done():
+				outErr <- ctx.Err()
+				if buffer.Len() > 0 {
+					assistantMsg := &domain.Message{
+						ID:        uuid.New(),
+						ChatID:    chatID,
+						Role:      domain.RoleAssistant,
+						Content:   buffer.String(),
+						Model:     finalModel,
+						CreatedAt: time.Now(),
+					}
+					_ = s.messageRepo.Create(context.Background(), assistantMsg)
+				}
+				return
+			}
+		}
+	}()
+
+	return outChunk, outErr, chatID.String(), nil
+}
