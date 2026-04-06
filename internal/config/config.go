@@ -74,9 +74,10 @@ type PrivacyConfig struct {
 }
 
 type RateLimitConfig struct {
-	AuthRPM   int `mapstructure:"RATE_LIMIT_AUTH_RPM"`
-	ChatRPM   int `mapstructure:"RATE_LIMIT_CHAT_RPM"`
-	StreamRPM int `mapstructure:"RATE_LIMIT_STREAM_RPM"`
+	AuthRPM    int `mapstructure:"RATE_LIMIT_AUTH_RPM"`
+	ChatRPM    int `mapstructure:"RATE_LIMIT_CHAT_RPM"`
+	StreamRPM  int `mapstructure:"RATE_LIMIT_STREAM_RPM"`
+	CouncilRPM int `mapstructure:"RATE_LIMIT_COUNCIL_RPM"`
 }
 
 type TimeoutConfig struct {
@@ -160,9 +161,10 @@ func Load() (*Config, error) {
 
 	// Rate Limiting
 	cfg.RateLimit = RateLimitConfig{
-		AuthRPM:   v.GetInt("RATE_LIMIT_AUTH_RPM"),
-		ChatRPM:   v.GetInt("RATE_LIMIT_CHAT_RPM"),
-		StreamRPM: v.GetInt("RATE_LIMIT_STREAM_RPM"),
+		AuthRPM:    v.GetInt("RATE_LIMIT_AUTH_RPM"),
+		ChatRPM:    v.GetInt("RATE_LIMIT_CHAT_RPM"),
+		StreamRPM:  v.GetInt("RATE_LIMIT_STREAM_RPM"),
+		CouncilRPM: v.GetInt("RATE_LIMIT_COUNCIL_RPM"),
 	}
 
 	// Timeout
@@ -260,6 +262,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("RATE_LIMIT_AUTH_RPM", 5)
 	v.SetDefault("RATE_LIMIT_CHAT_RPM", 60)
 	v.SetDefault("RATE_LIMIT_STREAM_RPM", 10)
+	v.SetDefault("RATE_LIMIT_COUNCIL_RPM", 10)
 
 	v.SetDefault("REQUEST_TIMEOUT_DEFAULT", "30s")
 	v.SetDefault("REQUEST_TIMEOUT_STREAM", "120s")
