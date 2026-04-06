@@ -47,8 +47,9 @@ type CreateChatInput struct {
 
 // SendMessageInput holds data for sending a message.
 type SendMessageInput struct {
-	Content string `json:"content"`
-	APIKey  string `json:"-"` // BYOK key, never serialized
+	Content string             `json:"content"`
+	APIKey  string             `json:"-"` // BYOK key, never serialized
+	Role    domain.MessageRole `json:"role,omitempty"`
 }
 
 // SendMessageResult holds the result of sending a message.
@@ -170,11 +171,17 @@ func (s *ChatService) SendMessage(ctx context.Context, userID, chatID uuid.UUID,
 		return nil, domain.ErrForbidden
 	}
 
-	// Save user message
+	// Determine role
+	role := input.Role
+	if role == "" {
+		role = domain.RoleUser
+	}
+
+	// Save the input message
 	userMsg := &domain.Message{
 		ID:        uuid.New(),
 		ChatID:    chatID,
-		Role:      domain.RoleUser,
+		Role:      role,
 		Content:   input.Content,
 		CreatedAt: time.Now(),
 	}
@@ -242,4 +249,23 @@ func (s *ChatService) SendMessage(ctx context.Context, userID, chatID uuid.UUID,
 		UserMessage:      userMsg,
 		AssistantMessage: assistantMsg,
 	}, nil
+}
+
+// CreateChatAndSendFirstMessage creates a chat and sends the first message atomically.
+func (s *ChatService) CreateChatAndSendFirstMessage(ctx context.Context, userID uuid.UUID, createInput CreateChatInput, sendInput SendMessageInput) (*domain.Chat, *SendMessageResult, error) {
+	chat, err := s.CreateChat(ctx, userID, createInput)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	result, err := s.SendMessage(ctx, userID, chat.ID, sendInput)
+	if err != nil {
+		// Attempt to undo the chat creation. Errors in rollback are noted but original error returned.
+		if delErr := s.DeleteChat(ctx, userID, chat.ID); delErr != nil {
+			s.log.ErrorContext(ctx, "failed to rollback chat creation", "chat_id", chat.ID, "error", delErr)
+		}
+		return nil, nil, err
+	}
+
+	return chat, result, nil
 }

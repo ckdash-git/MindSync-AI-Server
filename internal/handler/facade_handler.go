@@ -29,24 +29,26 @@ var defaultCouncilModels = []string{
 type FacadeHandler struct {
 	chatService  *service.ChatService
 	defaultModel string
+	rateLimiter  *middleware.RateLimiter
 	log          *logger.Logger
 }
 
 // NewFacadeHandler creates a new FacadeHandler.
-func NewFacadeHandler(chatService *service.ChatService, defaultModel string, log *logger.Logger) *FacadeHandler {
+func NewFacadeHandler(chatService *service.ChatService, defaultModel string, rateLimiter *middleware.RateLimiter, log *logger.Logger) *FacadeHandler {
 	return &FacadeHandler{
 		chatService:  chatService,
 		defaultModel: defaultModel,
+		rateLimiter:  rateLimiter,
 		log:          log,
 	}
 }
 
 // RegisterRoutes registers the simplified façade routes on the given router.
 func (h *FacadeHandler) RegisterRoutes(r chi.Router) {
-	r.With(middleware.RequireAuth).Post("/chat", h.SimpleChat)
-	r.With(middleware.RequireAuth).Post("/explain", h.Explain)
-	r.With(middleware.RequireAuth).Post("/ai-council", h.AICouncil)
-	r.With(middleware.RequireAuth).Post("/session/summary", h.SessionSummary)
+	r.With(middleware.RequireAuth, h.rateLimiter.Handler("chat")).Post("/chat", h.SimpleChat)
+	r.With(middleware.RequireAuth, h.rateLimiter.Handler("chat")).Post("/explain", h.Explain)
+	r.With(middleware.RequireAuth, h.rateLimiter.Handler("chat")).Post("/ai-council", h.AICouncil)
+	r.With(middleware.RequireAuth, h.rateLimiter.Handler("chat")).Post("/session/summary", h.SessionSummary)
 }
 
 // ── Request / Response Types ────────────────────────────────────────────────
@@ -149,26 +151,19 @@ func (h *FacadeHandler) SimpleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Auto-generate a title from the first 50 characters of the message.
-	title := req.Message
-	if len(title) > 50 {
-		title = title[:50] + "..."
-	}
+	title := truncate(req.Message, 50)
 
-	// Step 1: Create a chat.
-	chat, err := h.chatService.CreateChat(r.Context(), claims.UserID, service.CreateChatInput{
-		Title: title,
-		Model: model,
-	})
-	if err != nil {
-		h.handleError(w, r, err)
-		return
-	}
-
-	// Step 2: Send the message and get AI response.
-	result, err := h.chatService.SendMessage(r.Context(), claims.UserID, chat.ID, service.SendMessageInput{
-		Content: req.Message,
-		APIKey:  req.APIKey,
-	})
+	// Step 1: Create a chat and send the first message atomically.
+	chat, result, err := h.chatService.CreateChatAndSendFirstMessage(r.Context(), claims.UserID,
+		service.CreateChatInput{
+			Title: title,
+			Model: model,
+		},
+		service.SendMessageInput{
+			Content: req.Message,
+			APIKey:  req.APIKey,
+		},
+	)
 	if err != nil {
 		h.handleError(w, r, err)
 		return
@@ -213,16 +208,6 @@ func (h *FacadeHandler) Explain(w http.ResponseWriter, r *http.Request) {
 
 	title := fmt.Sprintf("Explain: %s", truncate(req.Topic, 40))
 
-	// Create a chat for the explanation.
-	chat, err := h.chatService.CreateChat(r.Context(), claims.UserID, service.CreateChatInput{
-		Title: title,
-		Model: model,
-	})
-	if err != nil {
-		h.handleError(w, r, err)
-		return
-	}
-
 	// Compose the explain prompt.
 	prompt := fmt.Sprintf(
 		"You are a clear, concise explainer. Explain the following topic in a way that is "+
@@ -230,10 +215,18 @@ func (h *FacadeHandler) Explain(w http.ResponseWriter, r *http.Request) {
 			"Topic: %s", req.Topic,
 	)
 
-	result, err := h.chatService.SendMessage(r.Context(), claims.UserID, chat.ID, service.SendMessageInput{
-		Content: prompt,
-		APIKey:  req.APIKey,
-	})
+	// Create a chat and send the explain prompt atomically.
+	_, result, err := h.chatService.CreateChatAndSendFirstMessage(r.Context(), claims.UserID,
+		service.CreateChatInput{
+			Title: title,
+			Model: model,
+		},
+		service.SendMessageInput{
+			Content: prompt,
+			APIKey:  req.APIKey,
+			Role:    domain.RoleSystem, // Important: explicitly inject as system prompt
+		},
+	)
 	if err != nil {
 		h.handleError(w, r, err)
 		return
@@ -273,8 +266,28 @@ func (h *FacadeHandler) AICouncil(w http.ResponseWriter, r *http.Request) {
 
 	models := req.Models
 	if len(models) == 0 {
-		models = defaultCouncilModels
+		models = append([]string(nil), defaultCouncilModels...)
 	}
+
+	seen := make(map[string]struct{}, len(models))
+	filtered := make([]string, 0, len(models))
+	for _, m := range models {
+		m = strings.TrimSpace(m)
+		if m == "" {
+			response.BadRequest(w, "models must not contain empty values")
+			return
+		}
+		if _, ok := seen[m]; ok {
+			continue
+		}
+		seen[m] = struct{}{}
+		filtered = append(filtered, m)
+	}
+	if len(filtered) > 5 {
+		response.BadRequest(w, "at most 5 models are supported")
+		return
+	}
+	models = filtered
 
 	title := fmt.Sprintf("Council: %s", truncate(req.Question, 40))
 
@@ -289,26 +302,20 @@ func (h *FacadeHandler) AICouncil(w http.ResponseWriter, r *http.Request) {
 
 			opinion := CouncilOpinion{Model: m}
 
-			// Each model gets its own chat.
-			chat, err := h.chatService.CreateChat(r.Context(), claims.UserID, service.CreateChatInput{
-				Title: fmt.Sprintf("%s [%s]", title, m),
-				Model: m,
-			})
-			if err != nil {
-				opinion.Error = "failed to create chat"
-				h.log.ErrorContext(r.Context(), "council: create chat failed",
-					"model", m, "error", err)
-				opinions[idx] = opinion
-				return
-			}
-
-			result, err := h.chatService.SendMessage(r.Context(), claims.UserID, chat.ID, service.SendMessageInput{
-				Content: req.Question,
-				APIKey:  req.APIKey,
-			})
+			// Each model gets its own chat, performed atomically.
+			_, result, err := h.chatService.CreateChatAndSendFirstMessage(r.Context(), claims.UserID,
+				service.CreateChatInput{
+					Title: fmt.Sprintf("%s [%s]", title, m),
+					Model: m,
+				},
+				service.SendMessageInput{
+					Content: req.Question,
+					APIKey:  req.APIKey,
+				},
+			)
 			if err != nil {
 				opinion.Error = "model failed to respond"
-				h.log.ErrorContext(r.Context(), "council: send message failed",
+				h.log.ErrorContext(r.Context(), "council: exchange failed",
 					"model", m, "error", err)
 				opinions[idx] = opinion
 				return
@@ -392,19 +399,16 @@ func (h *FacadeHandler) SessionSummary(w http.ResponseWriter, r *http.Request) {
 		summaryModel = chat.Model
 	}
 
-	summaryChat, err := h.chatService.CreateChat(r.Context(), claims.UserID, service.CreateChatInput{
-		Title: fmt.Sprintf("Summary: %s", truncate(chat.Title, 40)),
-		Model: summaryModel,
-	})
-	if err != nil {
-		h.handleError(w, r, err)
-		return
-	}
-
-	result, err := h.chatService.SendMessage(r.Context(), claims.UserID, summaryChat.ID, service.SendMessageInput{
-		Content: sb.String(),
-		APIKey:  req.APIKey,
-	})
+	_, result, err := h.chatService.CreateChatAndSendFirstMessage(r.Context(), claims.UserID,
+		service.CreateChatInput{
+			Title: fmt.Sprintf("Summary: %s", truncate(chat.Title, 40)),
+			Model: summaryModel,
+		},
+		service.SendMessageInput{
+			Content: sb.String(),
+			APIKey:  req.APIKey,
+		},
+	)
 	if err != nil {
 		h.handleError(w, r, err)
 		return
@@ -448,10 +452,11 @@ func (h *FacadeHandler) handleError(w http.ResponseWriter, r *http.Request, err 
 
 // truncate limits a string to maxLen characters, appending "..." if truncated.
 func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
+	runes := []rune(s)
+	if len(runes) <= maxLen {
 		return s
 	}
-	return s[:maxLen] + "..."
+	return string(runes[:maxLen]) + "..."
 }
 
 // parseUUID parses a string into a uuid.UUID.
